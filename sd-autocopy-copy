@@ -1,0 +1,51 @@
+#!/bin/bash
+#
+# sd-autocopy-copy - User-level script that copies files from mounted SD card.
+# Called by sd-autocopy (root script) after mounting.
+
+TARGET=~/autocopy
+FILE_MATCH=".*\.(JPG|CR2|MOV)$"
+TRANSFER="cp --one-file-system"
+MOUNT="$1"
+
+# END OF CONFIGURATION ########################################################
+
+if [ -z "$MOUNT" ] || [ ! -d "$MOUNT" ]; then
+    logger -t sd-autocopy "Mount point $MOUNT not available"
+    exit 1
+fi
+
+LINES=$(find "$MOUNT" -regextype posix-egrep -iregex "$FILE_MATCH" -not -ipath "*/old/*" -printf "%TY-%Tm-%Td_%p\n")
+
+NUM=0
+FAILED=0
+for LINE in $LINES; do
+    DATE=${LINE%%_*}
+    FILE=${LINE#*_}
+    REL_DIR="$(dirname "${FILE#$MOUNT/}")"
+    EXT="${FILE##*.}"
+    EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+    DEST="$TARGET/$DATE/$REL_DIR/$EXT"
+    mkdir -p "$DEST"
+    logger -t sd-autocopy "Copying $FILE to $DEST"
+    if ! $TRANSFER "$FILE" "$DEST"; then
+        logger -t sd-autocopy "Failed to copy $FILE, skipping"
+        FAILED=$(($FAILED+1))
+        continue
+    fi
+    PARENT="$(dirname "$FILE")"
+    BASENAME="$(basename "$FILE")"
+    OLD_DEST="$PARENT/old/$BASENAME"
+    N=2
+    while [ -e "$OLD_DEST" ]; do
+        OLD_DEST="$PARENT/old/${N}/$BASENAME"
+        N=$(($N+1))
+    done
+    mkdir -p "$(dirname "$OLD_DEST")"
+    mv "$FILE" "$OLD_DEST"
+    NUM=$(($NUM+1))
+done
+
+sync
+
+logger -t sd-autocopy "Finished job. Copied $NUM files, $FAILED failures."
