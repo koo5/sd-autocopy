@@ -1,0 +1,7 @@
+# Camera cards: don't let udisks2/gvfs/Thunar auto-mount or auto-open them.
+# sd-autocopy mounts them itself. ID_FS_LABEL is populated by 60-persistent-storage,
+# so this file must sort after 60 (hence the 99- prefix).
+SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_FS_LABEL}=="EOS_DIGITAL|EOS2", ENV{UDISKS_IGNORE}="1"
+
+# Run the copy script on the first partition of any inserted block device.
+SUBSYSTEM=="block", ACTION=="add", ENV{DEVTYPE}=="partition", ATTR{partition}=="1", RUN+="/usr/bin/systemd-run --no-block --setenv=DEVNAME=/dev/%k /usr/local/bin/sd-autocopy"

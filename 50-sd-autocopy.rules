@@ -1,1 +1,0 @@
-SUBSYSTEM=="block", ACTION=="add", ENV{DEVTYPE}=="partition", ATTR{partition}=="1", RUN+="/usr/bin/systemd-run --no-block --setenv=DEVNAME=/dev/%k /home/koom/repos/LarsMichelsen/sd-autocopy/0/sd-autocopy/sd-autocopy"
