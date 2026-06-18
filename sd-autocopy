@@ -4,7 +4,7 @@
 # Root script: handles mount, UUID check, then hands off to user script.
 
 USER=koom
-HANDLED_UUIDS="2C32-CEEB"
+HANDLED_LABELS="EOS_DIGITAL,EOS2"
 MOUNT_BASE=/mnt/sd-autocopy
 SCRIPT_DIR="$(dirname "$0")"
 
@@ -14,22 +14,25 @@ if [ -z "$DEVNAME" ]; then
     exit 1
 fi
 
-# Probe filesystem UUID directly since udev env vars aren't available yet
-ID_FS_UUID=$(blkid -s UUID -o value "$DEVNAME")
+# Probe filesystem label directly since udev env vars aren't available yet.
+# Labels survive camera reformats; filesystem UUIDs do not.
+ID_FS_LABEL=$(blkid -s LABEL -o value "$DEVNAME")
 
-logger -t sd-autocopy "Starting sd-autocopy for device $DEVNAME (UUID=$ID_FS_UUID)"
+logger -t sd-autocopy "Starting sd-autocopy for device $DEVNAME (LABEL=$ID_FS_LABEL)"
 
-if [ -z "$ID_FS_UUID" ]; then
-    logger -t sd-autocopy "Could not determine UUID for $DEVNAME, skipping"
+if [ -z "$ID_FS_LABEL" ]; then
+    logger -t sd-autocopy "Could not determine LABEL for $DEVNAME, skipping"
     exit 1
 fi
 
-if ! echo "$HANDLED_UUIDS" | grep -i "$ID_FS_UUID" >/dev/null 2>&1; then
-    logger -t sd-autocopy "Got unhandled UUID, skipping (UUID: $ID_FS_UUID)"
+shopt -s nocasematch
+if [[ ",$HANDLED_LABELS," != *",${ID_FS_LABEL},"* ]]; then
+    logger -t sd-autocopy "Got unhandled LABEL, skipping (LABEL: $ID_FS_LABEL)"
     exit 1
 fi
+shopt -u nocasematch
 
-logger -t sd-autocopy "Got handled UUID ($ID_FS_UUID), mounting..."
+logger -t sd-autocopy "Got handled LABEL ($ID_FS_LABEL), mounting..."
 
 MOUNT="$MOUNT_BASE/$(date -u +%Y%m%d_%H%M%S)"
 mkdir -p "$MOUNT"

@@ -3,10 +3,11 @@
 # sd-autocopy-copy - User-level script that copies files from mounted SD card.
 # Called by sd-autocopy (root script) after mounting.
 
+BACKUP_TARGET=~/autobackup
 TARGET=~/autocopy
 FILE_MATCH=".*\.(JPG|CR2|MOV)$"
-TRANSFER="cp --one-file-system"
 MOUNT="$1"
+LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/sd-autocopy.lock"
 
 # END OF CONFIGURATION ########################################################
 
@@ -15,26 +16,64 @@ if [ -z "$MOUNT" ] || [ ! -d "$MOUNT" ]; then
     exit 1
 fi
 
-LINES=$(find "$MOUNT" -regextype posix-egrep -iregex "$FILE_MATCH" -not -ipath "*/old/*" -printf "%TY-%Tm-%Td_%p\n")
+exec 9>"$LOCKFILE" || { logger -t sd-autocopy "Cannot open lock $LOCKFILE"; exit 1; }
+if ! flock -n 9; then
+    logger -t sd-autocopy "Another sd-autocopy run is in progress, exiting"
+    exit 0
+fi
 
 NUM=0
 FAILED=0
-for LINE in $LINES; do
-    DATE=${LINE%%_*}
-    FILE=${LINE#*_}
+
+while IFS= read -r -d '' FILE; do
+    DATE=$(date -d "@$(stat -c%Y "$FILE")" +%Y-%m-%d)
     REL_DIR="$(dirname "${FILE#$MOUNT/}")"
-    EXT="${FILE##*.}"
+    BASENAME="$(basename "$FILE")"
+    EXT="${BASENAME##*.}"
     EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-    DEST="$TARGET/$DATE/$REL_DIR/$EXT"
-    mkdir -p "$DEST"
-    logger -t sd-autocopy "Copying $FILE to $DEST"
-    if ! $TRANSFER "$FILE" "$DEST"; then
+    LAST_DIR="$(basename "$REL_DIR")"
+    RAW_DEST="$BACKUP_TARGET/$DATE/$REL_DIR"
+    EXT_DEST="$TARGET/$DATE/$REL_DIR/$EXT"
+    RAW_FINAL="$RAW_DEST/$BASENAME"
+    RAW_TMP="$RAW_DEST/.${BASENAME}.partial"
+    EXT_FINAL="$EXT_DEST/${DATE}_${LAST_DIR}_${BASENAME}"
+    mkdir -p "$RAW_DEST" "$EXT_DEST"
+    logger -t sd-autocopy "Copying $FILE to $RAW_DEST"
+
+    # Step 1: copy to temp name with timestamp preserved
+    if ! cp --preserve=timestamps --one-file-system "$FILE" "$RAW_TMP"; then
         logger -t sd-autocopy "Failed to copy $FILE, skipping"
+        rm -f "$RAW_TMP"
         FAILED=$(($FAILED+1))
         continue
     fi
+
+    # Step 2: verify size matches source
+    SRC_SIZE=$(stat -c%s "$FILE")
+    DST_SIZE=$(stat -c%s "$RAW_TMP")
+    if [ "$SRC_SIZE" != "$DST_SIZE" ]; then
+        logger -t sd-autocopy "Size mismatch for $FILE (src=$SRC_SIZE dst=$DST_SIZE), skipping"
+        rm -f "$RAW_TMP"
+        FAILED=$(($FAILED+1))
+        continue
+    fi
+
+    # Step 3: atomically rename into place, then flush data + rename together
+    mv "$RAW_TMP" "$RAW_FINAL"
+    sync -f "$RAW_FINAL" 2>/dev/null || sync
+
+    # Step 4: mirror into ext subdir, check for failure, flush
+    if ! cp --reflink=auto --preserve=timestamps "$RAW_FINAL" "$EXT_FINAL"; then
+        logger -t sd-autocopy "Failed to mirror $RAW_FINAL into $EXT_DEST, skipping mv-to-old"
+        FAILED=$(($FAILED+1))
+        continue
+    fi
+    chmod -x "$EXT_FINAL"
+
+    sync -f "$EXT_FINAL" 2>/dev/null || sync
+
+    # Step 5: only now move source out of the find path on the card
     PARENT="$(dirname "$FILE")"
-    BASENAME="$(basename "$FILE")"
     OLD_DEST="$PARENT/old/$BASENAME"
     N=2
     while [ -e "$OLD_DEST" ]; do
@@ -44,7 +83,7 @@ for LINE in $LINES; do
     mkdir -p "$(dirname "$OLD_DEST")"
     mv "$FILE" "$OLD_DEST"
     NUM=$(($NUM+1))
-done
+done < <(find "$MOUNT" -regextype posix-egrep -iregex "$FILE_MATCH" -not -ipath "*/old/*" -print0)
 
 sync
 
