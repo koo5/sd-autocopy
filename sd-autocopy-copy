@@ -8,6 +8,7 @@ TARGET=~/autocopy
 FILE_MATCH=".*\.(JPG|CR2|MOV)$"
 MOUNT="$1"
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/sd-autocopy.lock"
+ALERT_PY=/home/koom/hackery2/src/hackery2/lib/alert.py
 
 # END OF CONFIGURATION ########################################################
 
@@ -23,10 +24,36 @@ if ! flock -n 9; then
 fi
 
 NUM=0
-FAILED=0
+
+# A failing read means the card or reader is dropping out. There is no such
+# thing as recovering from that by moving on to the next file: the errors just
+# cascade, and an unchecked stat yields an empty DATE, which scatters files
+# outside the date-bucketed layout (~/autobackup//DCIM/...). Abort the whole run
+# on the first sign of trouble and leave the card untouched.
+abort() {
+    logger -t sd-autocopy "ABORT: $1"
+    logger -t sd-autocopy "Aborted job. Copied $NUM files before failure."
+    # Append-only: a later clean run must not erase the record of an earlier
+    # failure. The alert lands in the synced per-host tree, so it is visible
+    # from any machine. Clear the file by hand once it has been acted on.
+    python3 "$ALERT_PY" append sd-autocopy "aborted after $NUM file(s): $1" \
+        >/dev/null 2>&1
+    exit 1
+}
+
+# Snapshot the file list up front: a find that dies mid-traversal on a dropping
+# card would otherwise just end the loop early and report a clean finish.
+FILELIST=$(mktemp) || abort "cannot create temp file list"
+trap 'rm -f "$FILELIST"' EXIT
+find "$MOUNT" -regextype posix-egrep -iregex "$FILE_MATCH" -not -ipath "*/old/*" -print0 \
+    > "$FILELIST" || abort "cannot list files on $MOUNT (card dropped out?)"
 
 while IFS= read -r -d '' FILE; do
-    DATE=$(date -d "@$(stat -c%Y "$FILE")" +%Y-%m-%d)
+    MTIME=$(stat -c%Y "$FILE" 2>/dev/null) ||
+        abort "cannot stat $FILE (card dropped out?)"
+    DATE=$(date -d "@$MTIME" +%Y-%m-%d) ||
+        abort "cannot derive date for $FILE (mtime='$MTIME')"
+    [ -n "$DATE" ] || abort "empty date for $FILE (mtime='$MTIME')"
     REL_DIR="$(dirname "${FILE#$MOUNT/}")"
     BASENAME="$(basename "$FILE")"
     EXT="${BASENAME##*.}"
@@ -37,36 +64,30 @@ while IFS= read -r -d '' FILE; do
     RAW_FINAL="$RAW_DEST/$BASENAME"
     RAW_TMP="$RAW_DEST/.${BASENAME}.partial"
     EXT_FINAL="$EXT_DEST/${DATE}_${LAST_DIR}_${BASENAME}"
-    mkdir -p "$RAW_DEST" "$EXT_DEST"
+    mkdir -p "$RAW_DEST" "$EXT_DEST" || abort "cannot create $RAW_DEST / $EXT_DEST"
     logger -t sd-autocopy "Copying $FILE to $RAW_DEST"
 
     # Step 1: copy to temp name with timestamp preserved
     if ! cp --preserve=timestamps --one-file-system "$FILE" "$RAW_TMP"; then
-        logger -t sd-autocopy "Failed to copy $FILE, skipping"
         rm -f "$RAW_TMP"
-        FAILED=$(($FAILED+1))
-        continue
+        abort "failed to copy $FILE"
     fi
 
     # Step 2: verify size matches source
-    SRC_SIZE=$(stat -c%s "$FILE")
-    DST_SIZE=$(stat -c%s "$RAW_TMP")
-    if [ "$SRC_SIZE" != "$DST_SIZE" ]; then
-        logger -t sd-autocopy "Size mismatch for $FILE (src=$SRC_SIZE dst=$DST_SIZE), skipping"
+    SRC_SIZE=$(stat -c%s "$FILE" 2>/dev/null)
+    DST_SIZE=$(stat -c%s "$RAW_TMP" 2>/dev/null)
+    if [ -z "$SRC_SIZE" ] || [ "$SRC_SIZE" != "$DST_SIZE" ]; then
         rm -f "$RAW_TMP"
-        FAILED=$(($FAILED+1))
-        continue
+        abort "size mismatch for $FILE (src='$SRC_SIZE' dst='$DST_SIZE')"
     fi
 
     # Step 3: atomically rename into place, then flush data + rename together
-    mv "$RAW_TMP" "$RAW_FINAL"
+    mv "$RAW_TMP" "$RAW_FINAL" || abort "cannot rename $RAW_TMP into place"
     sync -f "$RAW_FINAL" 2>/dev/null || sync
 
     # Step 4: mirror into ext subdir, check for failure, flush
     if ! cp --reflink=auto --preserve=timestamps "$RAW_FINAL" "$EXT_FINAL"; then
-        logger -t sd-autocopy "Failed to mirror $RAW_FINAL into $EXT_DEST, skipping mv-to-old"
-        FAILED=$(($FAILED+1))
-        continue
+        abort "failed to mirror $RAW_FINAL into $EXT_DEST"
     fi
     chmod -x "$EXT_FINAL"
 
@@ -80,11 +101,11 @@ while IFS= read -r -d '' FILE; do
         OLD_DEST="$PARENT/old/${N}/$BASENAME"
         N=$(($N+1))
     done
-    mkdir -p "$(dirname "$OLD_DEST")"
-    mv "$FILE" "$OLD_DEST"
+    mkdir -p "$(dirname "$OLD_DEST")" || abort "cannot create $(dirname "$OLD_DEST") on card"
+    mv "$FILE" "$OLD_DEST" || abort "cannot move $FILE aside on card"
     NUM=$(($NUM+1))
-done < <(find "$MOUNT" -regextype posix-egrep -iregex "$FILE_MATCH" -not -ipath "*/old/*" -print0)
+done < "$FILELIST"
 
 sync
 
-logger -t sd-autocopy "Finished job. Copied $NUM files, $FAILED failures."
+logger -t sd-autocopy "Finished job. Copied $NUM files."
