@@ -220,5 +220,10 @@ Running by hand
 Tests: ``uv run --locked --script tests/test_copy.py`` (a fake card of tiny
 JPEGs stamped with exiftool; nothing touches the real trees).
 
-Install: ``sudo cp sd-autocopy sd-autocopy-copy /usr/local/bin/`` and the
-udev rule into ``/etc/udev/rules.d/`` (see ``99-sd-autocopy.rules``).
+Install: this checkout is canonical. The udev rule runs ``sd-autocopy``
+from here by absolute path and the root script finds ``sd-autocopy-copy``
+next to itself, so the scripts are never copied anywhere (a branch switch
+changes what udev runs; anything left under ``/usr/local/bin`` is dead).
+Only the rule is installed::
+
+    sudo cp 99-sd-autocopy.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules

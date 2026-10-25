@@ -3,5 +3,7 @@
 # so this file must sort after 60 (hence the 99- prefix).
 SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_FS_LABEL}=="EOS_DIGITAL|EOS2", ENV{UDISKS_IGNORE}="1"
 
-# Run the copy script on the first partition of any inserted block device.
-SUBSYSTEM=="block", ACTION=="add", ENV{DEVTYPE}=="partition", ATTR{partition}=="1", RUN+="/usr/bin/systemd-run --no-block --setenv=DEVNAME=/dev/%k /usr/local/bin/sd-autocopy"
+# Run the root script on the first partition of any inserted block device —
+# straight from the git checkout (canonical; it finds sd-autocopy-copy next
+# to itself), so nothing is copied to /usr/local/bin.
+SUBSYSTEM=="block", ACTION=="add", ENV{DEVTYPE}=="partition", ATTR{partition}=="1", RUN+="/usr/bin/systemd-run --no-block --setenv=DEVNAME=/dev/%k /home/koom/repos/koo5/sd-autocopy/0/sd-autocopy/sd-autocopy"
