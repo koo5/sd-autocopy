@@ -1,111 +1,538 @@
-#!/bin/bash
-#
-# sd-autocopy-copy - User-level script that copies files from mounted SD card.
-# Called by sd-autocopy (root script) after mounting.
+#!/usr/bin/env python3
+"""sd-autocopy-copy - copy an inserted camera card into the dated archive.
 
-BACKUP_TARGET=~/autobackup
-TARGET=~/autocopy
-FILE_MATCH=".*\.(JPG|CR2|MOV)$"
-MOUNT="$1"
-LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/sd-autocopy.lock"
-ALERT_PY=/home/koom/hackery2/src/hackery2/lib/alert.py
+Called by sd-autocopy (the root script) as the owning user, with the mount
+point as the only argument; ``--dry-run MOUNT`` prints the plan and touches
+nothing.
 
-# END OF CONFIGURATION ########################################################
+Two trees are written per card file::
 
-if [ -z "$MOUNT" ] || [ ! -d "$MOUNT" ]; then
-    logger -t sd-autocopy "Mount point $MOUNT not available"
-    exit 1
-fi
+    ~/autobackup/<YYYY-MM-DD>/<DCIM/...>/<basename>      verbatim mirror
+    ~/autocopy/<YYYY-MM-DD>/<ext>/<new name>             the pipeline workdir
 
-exec 9>"$LOCKFILE" || { logger -t sd-autocopy "Cannot open lock $LOCKFILE"; exit 1; }
-if ! flock -n 9; then
-    logger -t sd-autocopy "Another sd-autocopy run is in progress, exiting"
-    exit 0
-fi
+``<new name>`` is ``<YYYYMMDD>_<HHMMSS>_<mmm>Z_<camtoken>_<basename>``, e.g.
+``20260915_125724_990Z_5ds_AAAE2634.CR2``: the capture instant in UTC (EXIF
+DateTimeOriginal + SubSecTimeOriginal + OffsetTimeOriginal; QuickTime
+CreateDate for MOV), a camera token, then the camera's own basename. Names
+therefore sort in capture order whatever the card's DCIM folders, wherever
+the frame counter wrapped, and whichever zone the camera or this host was
+set to; the date dir is the same UTC day. The DCIM folder is not part of
+the layout: every folder of one card merges into one workdir. The trailing
+camera basename is what the pipeline's bracket detection reads the frame
+counter from, and what greps straight back to the card / autobackup.
 
-NUM=0
+Per file, two stages (so exiftool never reads the card):
 
-# A failing read means the card or reader is dropping out. There is no such
-# thing as recovering from that by moving on to the next file: the errors just
-# cascade, and an unchecked stat yields an empty DATE, which scatters files
-# outside the date-bucketed layout (~/autobackup//DCIM/...). Abort the whole run
-# on the first sign of trouble and leave the card untouched.
-abort() {
-    logger -t sd-autocopy "ABORT: $1"
-    logger -t sd-autocopy "Aborted job. Copied $NUM files before failure."
-    # Append-only: a later clean run must not erase the record of an earlier
-    # failure. The alert lands in the synced per-host tree, so it is visible
-    # from any machine. Clear the file by hand once it has been acted on.
-    python3 "$ALERT_PY" append sd-autocopy "aborted after $NUM file(s): $1" \
-        >/dev/null 2>&1
-    exit 1
-}
+  1. copier, serial, main thread: card -> ``autobackup/.../.<name>.partial``,
+     verify size, rename into place, fsync.
+  2. namer, thread pool: exiftool on the LOCAL copy -> instant + token ->
+     re-home the backup if its UTC day differs from the mtime guess ->
+     reflink-mirror into autocopy under the new name (partial + rename)
+     -> only now move the card file into ``<folder>/old/``.
 
-# Snapshot the file list up front: a find that dies mid-traversal on a dropping
-# card would otherwise just end the loop early and report a clean finish.
-FILELIST=$(mktemp) || abort "cannot create temp file list"
-trap 'rm -f "$FILELIST"' EXIT
-find "$MOUNT" -regextype posix-egrep -iregex "$FILE_MATCH" -not -ipath "*/old/*" -print0 \
-    > "$FILELIST" || abort "cannot list files on $MOUNT (card dropped out?)"
+A failing read means the card or reader is dropping out, and there is no
+recovering from that by moving on: the first failure of either stage aborts
+the whole run, leaves the card as it is and appends an alert (see
+``abort``). Re-inserting the card resumes: files already in ``old/`` are
+skipped by the walk, and a destination that already exists with the right
+size counts as copied.
 
-while IFS= read -r -d '' FILE; do
-    MTIME=$(stat -c%Y "$FILE" 2>/dev/null) ||
-        abort "cannot stat $FILE (card dropped out?)"
-    DATE=$(date -d "@$MTIME" +%Y-%m-%d) ||
-        abort "cannot derive date for $FILE (mtime='$MTIME')"
-    [ -n "$DATE" ] || abort "empty date for $FILE (mtime='$MTIME')"
-    REL_DIR="$(dirname "${FILE#$MOUNT/}")"
-    BASENAME="$(basename "$FILE")"
-    EXT="${BASENAME##*.}"
-    EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-    LAST_DIR="$(basename "$REL_DIR")"
-    RAW_DEST="$BACKUP_TARGET/$DATE/$REL_DIR"
-    EXT_DEST="$TARGET/$DATE/$REL_DIR/$EXT"
-    RAW_FINAL="$RAW_DEST/$BASENAME"
-    RAW_TMP="$RAW_DEST/.${BASENAME}.partial"
-    EXT_FINAL="$EXT_DEST/${DATE}_${LAST_DIR}_${BASENAME}"
-    mkdir -p "$RAW_DEST" "$EXT_DEST" || abort "cannot create $RAW_DEST / $EXT_DEST"
-    logger -t sd-autocopy "Copying $FILE to $RAW_DEST"
+Config, ``~/.config/sd-autocopy/env`` (``KEY=VALUE`` lines, all optional)::
 
-    # Step 1: copy to temp name with timestamp preserved
-    if ! cp --preserve=timestamps --one-file-system "$FILE" "$RAW_TMP"; then
-        rm -f "$RAW_TMP"
-        abort "failed to copy $FILE"
-    fi
+    AUTOCOPY_TARGET=~/autocopy
+    AUTOCOPY_BACKUP=~/autobackup
+    ALERT_PY=/home/koom/hackery2/src/hackery2/lib/alert.py
+    WORKERS=2
+    CAM_ALIAS_363055000036=5ds        # camera token per body serial
 
-    # Step 2: verify size matches source
-    SRC_SIZE=$(stat -c%s "$FILE" 2>/dev/null)
-    DST_SIZE=$(stat -c%s "$RAW_TMP" 2>/dev/null)
-    if [ -z "$SRC_SIZE" ] || [ "$SRC_SIZE" != "$DST_SIZE" ]; then
-        rm -f "$RAW_TMP"
-        abort "size mismatch for $FILE (src='$SRC_SIZE' dst='$DST_SIZE')"
-    fi
+An unaliased body is named ``<ModelShort>-<Serial>`` (``5DS-363055000036``).
+Tokens are ``[A-Za-z0-9-]+``: ``_`` is the name separator.
+"""
 
-    # Step 3: atomically rename into place, then flush data + rename together
-    mv "$RAW_TMP" "$RAW_FINAL" || abort "cannot rename $RAW_TMP into place"
-    sync -f "$RAW_FINAL" 2>/dev/null || sync
+from __future__ import annotations
 
-    # Step 4: mirror into ext subdir, check for failure, flush
-    if ! cp --reflink=auto --preserve=timestamps "$RAW_FINAL" "$EXT_FINAL"; then
-        abort "failed to mirror $RAW_FINAL into $EXT_DEST"
-    fi
-    chmod -x "$EXT_FINAL"
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import subprocess
+import sys
+import syslog
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-    sync -f "$EXT_FINAL" 2>/dev/null || sync
+TAG = "sd-autocopy"
+FILE_EXTS = {"jpg", "cr2", "mov"}
+CARD_OLD_DIR = "old"
+DEFAULT_CONFIG = Path.home() / ".config" / "sd-autocopy" / "env"
+DEFAULT_ALERT_PY = Path("/home/koom/hackery2/src/hackery2/lib/alert.py")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9-]+$")
+NOCAM_TOKEN = "nocam"
 
-    # Step 5: only now move source out of the find path on the card
-    PARENT="$(dirname "$FILE")"
-    OLD_DEST="$PARENT/old/$BASENAME"
-    N=2
-    while [ -e "$OLD_DEST" ]; do
-        OLD_DEST="$PARENT/old/${N}/$BASENAME"
-        N=$(($N+1))
-    done
-    mkdir -p "$(dirname "$OLD_DEST")" || abort "cannot create $(dirname "$OLD_DEST") on card"
-    mv "$FILE" "$OLD_DEST" || abort "cannot move $FILE aside on card"
-    NUM=$(($NUM+1))
-done < "$FILELIST"
+# One exiftool call per file, tab-separated, "-" for a missing tag.
+# QuickTimeUTC: MOV CreateDate is UTC by the QuickTime spec; with the API
+# option exiftool emits it with an explicit zone, so one parser serves both.
+EXIFTOOL_CMD = [
+	"exiftool", "-T", "-fast", "-api", "QuickTimeUTC=1",
+	"-Model", "-SerialNumber", "-InternalSerialNumber",
+	"-DateTimeOriginal", "-SubSecTimeOriginal", "-OffsetTimeOriginal",
+	"-CreateDate",
+]
 
-sync
+_EXIF_DT_RE = re.compile(
+	r"^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*"
+	r"(Z|[+-]\d{2}:?\d{2})?$"
+)
 
-logger -t sd-autocopy "Finished job. Copied $NUM files."
+
+class AbortError(Exception):
+	"""A failure that ends the run (card untouched from here on)."""
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Config:
+	target: Path = Path.home() / "autocopy"
+	backup: Path = Path.home() / "autobackup"
+	alert_py: Path = DEFAULT_ALERT_PY
+	workers: int = 2
+	aliases: dict[str, str] = field(default_factory=dict)
+
+
+def load_config(path: Path) -> Config:
+	"""``KEY=VALUE`` lines; ``#`` comments; optional single/double quotes."""
+	cfg = Config()
+	if not path.is_file():
+		return cfg
+	for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+		line = raw.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		key, _, value = line.partition("=")
+		key, value = key.strip(), value.split("#", 1)[0].strip().strip("'\"")
+		if key == "AUTOCOPY_TARGET":
+			cfg.target = Path(value).expanduser()
+		elif key == "AUTOCOPY_BACKUP":
+			cfg.backup = Path(value).expanduser()
+		elif key == "ALERT_PY":
+			cfg.alert_py = Path(value).expanduser()
+		elif key == "WORKERS":
+			cfg.workers = max(1, int(value))
+		elif key.startswith("CAM_ALIAS_"):
+			serial = key[len("CAM_ALIAS_"):]
+			if not TOKEN_RE.match(value):
+				raise AbortError(
+					f"{path}:{lineno}: camera alias {value!r} for {serial} must "
+					f"match [A-Za-z0-9-]+ ('_' is the name separator)"
+				)
+			cfg.aliases[serial] = value
+		else:
+			raise AbortError(f"{path}:{lineno}: unknown key {key!r}")
+	return cfg
+
+
+# ---------------------------------------------------------------------------
+# EXIF -> instant + camera token + name
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Meta:
+	model: str = ""
+	serial: str = ""
+	internal_serial: str = ""
+	dto: str = ""          # DateTimeOriginal
+	subsec: str = ""       # SubSecTimeOriginal
+	offset: str = ""       # OffsetTimeOriginal
+	create_date: str = ""  # QuickTime CreateDate
+
+
+def read_meta(path: Path) -> Meta:
+	out = subprocess.run(
+		EXIFTOOL_CMD + [str(path)], capture_output=True, text=True,
+	)
+	if out.returncode not in (0, 1):   # 1 = "no tags" style minor errors
+		raise AbortError(f"exiftool failed on {path}: {out.stderr.strip()[:200]}")
+	row = out.stdout.rstrip("\n").split("\t")
+	if len(row) != 7:
+		row = [""] * 7
+	vals = ["" if v == "-" else v for v in row]
+	return Meta(*vals)
+
+
+def _parse_exif_dt(value: str) -> tuple[datetime | None, str]:
+	"""``2026:09:01 12:57:24[.99][+02:00]`` -> (datetime, fraction digits).
+
+	Aware when a zone is present, naive otherwise. ``None`` when the value
+	doesn't parse — an unset clock's ``0000:00:00 00:00:00`` included."""
+	m = _EXIF_DT_RE.match(value.strip())
+	if not m:
+		return None, ""
+	y, mo, d, h, mi, s, frac, zone = m.groups()
+	try:
+		dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(s))
+	except ValueError:   # 0000:00:00 00:00:00 — the clock was never set
+		return None, ""
+	if zone:
+		if zone == "Z":
+			dt = dt.replace(tzinfo=timezone.utc)
+		else:
+			sign = 1 if zone[0] == "+" else -1
+			zz = zone[1:].replace(":", "")
+			off = timedelta(hours=int(zz[:2]), minutes=int(zz[2:]))
+			dt = dt.replace(tzinfo=timezone(sign * off))
+	return dt, frac or ""
+
+
+def _millis(frac: str) -> int:
+	"""``'99'`` -> 990, ``'7'`` -> 700, ``'1234'`` -> 123, ``''`` -> 0."""
+	digits = re.sub(r"\D", "", frac)
+	return int(digits[:3].ljust(3, "0")) if digits else 0
+
+
+def capture_instant(meta: Meta, mtime: float) -> tuple[datetime, int, str | None]:
+	"""(UTC instant, milliseconds, warning-or-None) for one file.
+
+	Stills: DateTimeOriginal + SubSecTimeOriginal + OffsetTimeOriginal.
+	MOV: CreateDate (UTC per the QuickTime spec). A still without an offset
+	is taken as UTC wall clock and flagged — the file is still copied; the
+	pipeline refuses zone-less frames later, so the camera setting gets
+	fixed. No EXIF time at all: the file mtime, flagged.
+	"""
+	if meta.dto:
+		dt, frac = _parse_exif_dt(meta.dto)
+		if dt is not None:
+			ms = _millis(meta.subsec or frac)
+			if dt.tzinfo is None and meta.offset:
+				zdt, _ = _parse_exif_dt(f"{meta.dto.split('.')[0]}{meta.offset}")
+				if zdt is not None:
+					dt = zdt
+			if dt.tzinfo is None:
+				return (dt.replace(tzinfo=timezone.utc), ms,
+						"no timezone offset in EXIF; wall clock taken as UTC")
+			return dt.astimezone(timezone.utc), ms, None
+	if meta.create_date:
+		dt, frac = _parse_exif_dt(meta.create_date)
+		if dt is not None:
+			if dt.tzinfo is None:
+				dt = dt.replace(tzinfo=timezone.utc)
+			return dt.astimezone(timezone.utc), _millis(frac), None
+	dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+	return dt, int(round((mtime % 1) * 1000)) % 1000, "no EXIF time; file mtime taken"
+
+
+def _model_short(model: str) -> str:
+	s = re.sub(r"^Canon\s+EOS\s+", "", model.strip())
+	s = re.sub(r"^Canon\s+", "", s)
+	return s
+
+
+def camera_token(meta: Meta, aliases: dict[str, str]) -> tuple[str, str | None]:
+	"""(token, warning-or-None): the alias for the body's serial, else
+	``<ModelShort>-<Serial>`` squeezed into ``[A-Za-z0-9-]``."""
+	serial = meta.serial or meta.internal_serial
+	if serial and serial in aliases:
+		return aliases[serial], None
+	parts = [p for p in (_model_short(meta.model), serial) if p]
+	if not parts:
+		return NOCAM_TOKEN, "no camera model/serial in EXIF"
+	tok = re.sub(r"[^A-Za-z0-9-]+", "-", "-".join(parts)).strip("-")
+	return tok or NOCAM_TOKEN, None
+
+
+def build_name(instant: datetime, ms: int, token: str, basename: str) -> str:
+	return f"{instant:%Y%m%d_%H%M%S}_{ms:03d}Z_{token}_{basename}"
+
+
+# ---------------------------------------------------------------------------
+# filesystem helpers
+# ---------------------------------------------------------------------------
+
+def _fsync_path(p: Path) -> None:
+	fd = os.open(p, os.O_RDONLY)
+	try:
+		os.fsync(fd)
+	finally:
+		os.close(fd)
+
+
+def place_copy(src: Path, dst: Path, reflink: bool) -> str:
+	"""Put a copy of ``src`` at ``dst`` atomically. Returns ``"copied"`` or
+	``"exists"`` (same size already there). A different-sized file at
+	``dst`` aborts: a final name never holds a partial copy, so that can
+	only be a different file under the same name."""
+	src_size = src.stat().st_size
+	if dst.exists():
+		if dst.stat().st_size == src_size:
+			return "exists"
+		raise AbortError(
+			f"{dst} exists with a different size ({dst.stat().st_size} vs "
+			f"{src_size} on the card); refusing to overwrite"
+		)
+	dst.parent.mkdir(parents=True, exist_ok=True)
+	tmp = dst.parent / f".{dst.name}.partial"
+	if reflink:
+		subprocess.run(
+			["cp", "--reflink=auto", "--preserve=timestamps", str(src), str(tmp)],
+			check=True, capture_output=True, text=True,
+		)
+	else:
+		shutil.copy2(src, tmp)   # preserves the card mtime
+	if tmp.stat().st_size != src_size:
+		tmp.unlink(missing_ok=True)
+		raise AbortError(f"size mismatch copying {src} -> {tmp}")
+	os.replace(tmp, dst)
+	_fsync_path(dst)
+	_fsync_path(dst.parent)
+	return "copied"
+
+
+def rehome(src: Path, dst: Path) -> None:
+	"""Move the backup copy to its EXIF-dated dir (same filesystem)."""
+	if dst.exists():
+		if dst.stat().st_size == src.stat().st_size:
+			src.unlink()
+			return
+		raise AbortError(f"{dst} exists with a different size; refusing to replace")
+	dst.parent.mkdir(parents=True, exist_ok=True)
+	os.rename(src, dst)
+	_fsync_path(dst.parent)
+
+
+def retire_on_card(card_file: Path) -> Path:
+	"""Move the card file out of the walk's path: ``<folder>/old/<name>``,
+	then ``old/2/``, ``old/3/``... on a name collision."""
+	parent = card_file.parent
+	dest = parent / CARD_OLD_DIR / card_file.name
+	n = 2
+	while dest.exists():
+		dest = parent / CARD_OLD_DIR / str(n) / card_file.name
+		n += 1
+	dest.parent.mkdir(parents=True, exist_ok=True)
+	os.rename(card_file, dest)
+	return dest
+
+
+def snapshot(mount: Path) -> list[Path]:
+	"""Every card file to copy, sorted — taken up front so a walk that dies
+	mid-traversal on a dropping card can't look like a clean finish."""
+	out: list[Path] = []
+	for dirpath, dirnames, filenames in os.walk(mount, onerror=_walk_error):
+		dirnames[:] = sorted(d for d in dirnames if d.lower() != CARD_OLD_DIR)
+		for fn in filenames:
+			if fn.rsplit(".", 1)[-1].lower() in FILE_EXTS and "." in fn:
+				out.append(Path(dirpath) / fn)
+	return sorted(out)
+
+
+def _walk_error(err: OSError) -> None:
+	raise AbortError(f"cannot list {err.filename}: {err.strerror} (card dropped out?)")
+
+
+# ---------------------------------------------------------------------------
+# the run
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Job:
+	card_file: Path
+	rel_dir: Path          # DCIM/100EOS5D
+	mtime: float
+	backup_file: Path      # provisional (mtime-dated) backup copy
+	backup_state: str      # "copied" | "exists"
+
+
+@dataclass
+class Result:
+	job: Job
+	name: str
+	backup_final: Path
+	mirror: Path
+	mirror_state: str
+	warnings: list[str]
+
+
+class Run:
+	def __init__(self, cfg: Config, mount: Path, dry_run: bool, verbose: bool = False):
+		self.cfg, self.mount, self.dry_run = cfg, mount, dry_run
+		self.copied = 0
+		self.present = 0
+		self.warned: list[str] = []
+		self.stop = threading.Event()
+		self.first_error: BaseException | None = None
+		self.lock = threading.Lock()
+		self.echo = dry_run or verbose or sys.stderr.isatty()
+
+	# -- logging -----------------------------------------------------------
+	def log(self, msg: str) -> None:
+		syslog.syslog(msg)
+		if self.echo:
+			print(msg, file=sys.stderr, flush=True)
+
+	def alert(self, msg: str) -> None:
+		try:
+			subprocess.run(
+				[sys.executable, str(self.cfg.alert_py), "append", TAG, msg],
+				capture_output=True, timeout=30,
+			)
+		except (OSError, subprocess.SubprocessError):
+			pass
+
+	# -- naming ------------------------------------------------------------
+	def plan(self, meta: Meta, job: Job) -> Result:
+		instant, ms, w1 = capture_instant(meta, job.mtime)
+		token, w2 = camera_token(meta, self.cfg.aliases)
+		name = build_name(instant, ms, token, job.card_file.name)
+		day = instant.date().isoformat()
+		ext = job.card_file.suffix[1:].lower()
+		return Result(
+			job=job,
+			name=name,
+			backup_final=self.cfg.backup / day / job.rel_dir / job.card_file.name,
+			mirror=self.cfg.target / day / ext / name,
+			mirror_state="",
+			warnings=[f"{job.card_file.name}: {w}" for w in (w1, w2) if w],
+		)
+
+	# -- stage 1 -------------------------------------------------------------
+	def copier(self, card_file: Path) -> Job:
+		st = card_file.stat()
+		rel_dir = card_file.parent.relative_to(self.mount)
+		day = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).date().isoformat()
+		backup_file = self.cfg.backup / day / rel_dir / card_file.name
+		self.log(f"Copying {card_file} to {backup_file.parent}")
+		state = place_copy(card_file, backup_file, reflink=False)
+		return Job(card_file, rel_dir, st.st_mtime, backup_file, state)
+
+	# -- stage 2 -------------------------------------------------------------
+	def namer(self, job: Job) -> Result:
+		meta = read_meta(job.backup_file)
+		res = self.plan(meta, job)
+		if res.backup_final != job.backup_file:
+			rehome(job.backup_file, res.backup_final)
+		res.mirror_state = place_copy(res.backup_final, res.mirror, reflink=True)
+		if res.mirror_state == "copied":
+			os.chmod(res.mirror, res.mirror.stat().st_mode & ~0o111)
+		retire_on_card(job.card_file)
+		with self.lock:
+			if res.mirror_state == "copied":
+				self.copied += 1
+			else:
+				self.present += 1
+			self.warned += res.warnings
+		for w in res.warnings:
+			self.log(f"WARNING {w}")
+		self.log(f"{job.card_file.name} -> {res.mirror}")
+		return res
+
+	def _namer_guarded(self, job: Job) -> None:
+		try:
+			self.namer(job)
+		except BaseException as e:   # noqa: BLE001 — recorded, re-raised by abort
+			with self.lock:
+				if self.first_error is None:
+					self.first_error = e
+			self.stop.set()
+
+	# -- orchestration -------------------------------------------------------
+	def execute(self, files: list[Path]) -> None:
+		with ThreadPoolExecutor(max_workers=self.cfg.workers) as pool:
+			for card_file in files:
+				if self.stop.is_set():
+					break
+				try:
+					job = self.copier(card_file)
+				except (OSError, AbortError, subprocess.SubprocessError) as e:
+					with self.lock:
+						if self.first_error is None:
+							self.first_error = e
+					self.stop.set()
+					break
+				pool.submit(self._namer_guarded, job)
+			# leaving the block waits for the submitted jobs
+		if self.first_error is not None:
+			raise self.first_error
+
+	def dry(self, files: list[Path]) -> None:
+		for card_file in files:
+			st = card_file.stat()
+			job = Job(card_file, card_file.parent.relative_to(self.mount),
+					  st.st_mtime, Path("-"), "dry")
+			res = self.plan(read_meta(card_file), job)
+			print(f"{card_file.relative_to(self.mount)}")
+			print(f"    backup  {res.backup_final}")
+			print(f"    mirror  {res.mirror}")
+			for w in res.warnings:
+				print(f"    WARNING {w}")
+		print(f"\n{len(files)} file(s) planned (dry run, nothing written)")
+
+
+def abort(run: Run, msg: str) -> int:
+	run.log(f"ABORT: {msg}")
+	run.log(f"Aborted job. Copied {run.copied} files before failure.")
+	# Append-only: a later clean run must not erase the record of an earlier
+	# failure. Clear the alert by hand once it has been acted on.
+	run.alert(f"aborted after {run.copied} file(s): {msg}")
+	return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+	parser = argparse.ArgumentParser(description="copy a mounted camera card into the dated archive")
+	parser.add_argument("mount", type=Path)
+	parser.add_argument("--dry-run", action="store_true", help="print the plan; write nothing")
+	parser.add_argument("-v", "--verbose", action="store_true",
+						help="echo the syslog lines to stderr even when it is not a terminal")
+	parser.add_argument("--config", type=Path,
+						default=Path(os.environ.get("SD_AUTOCOPY_CONFIG", DEFAULT_CONFIG)))
+	args = parser.parse_args(argv)
+	syslog.openlog(TAG)
+
+	try:
+		cfg = load_config(args.config)
+	except (AbortError, ValueError) as e:
+		run = Run(Config(), args.mount, args.dry_run, args.verbose)
+		return abort(run, f"bad config: {e}")
+	run = Run(cfg, args.mount, args.dry_run, args.verbose)
+
+	if not args.mount.is_dir():
+		run.log(f"Mount point {args.mount} not available")
+		return 1
+	lock_path = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"{TAG}.lock"
+	lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o644)
+	try:
+		fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except OSError:
+		run.log("Another sd-autocopy run is in progress, exiting")
+		return 0
+
+	try:
+		files = snapshot(args.mount)
+		if args.dry_run:
+			run.dry(files)
+			return 0
+		run.execute(files)
+	except (AbortError, OSError, subprocess.SubprocessError) as e:
+		return abort(run, str(e))
+	except Exception as e:   # noqa: BLE001 — a bug must still leave the ABORT record
+		return abort(run, f"{type(e).__name__}: {e}")
+	finally:
+		os.close(lock_fd)
+
+	os.sync()
+	if run.warned:
+		run.alert(f"{len(run.warned)} file(s) named without a usable EXIF "
+				  f"zone/time (wall clock taken as UTC): {', '.join(run.warned[:5])}"
+				  + (" ..." if len(run.warned) > 5 else ""))
+	run.log(f"Finished job. Copied {run.copied} files"
+			+ (f" ({run.present} already present)" if run.present else "") + ".")
+	return 0
+
+
+if __name__ == "__main__":
+	sys.exit(main())

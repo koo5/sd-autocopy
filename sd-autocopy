@@ -41,4 +41,4 @@ USER_ID=$(id -u $USER)
 GROUP_ID=$(id -g $USER)
 mount -o uid=$USER_ID,gid=$GROUP_ID $DEVNAME "$MOUNT"
 
-su - $USER -s /bin/bash -- "$SCRIPT_DIR/sd-autocopy-copy" "$MOUNT"
+su - $USER -s /usr/bin/env python3 -- "$SCRIPT_DIR/sd-autocopy-copy" "$MOUNT"

@@ -131,41 +131,94 @@ event. This event comes with the following environment variables:
 The sd-autocopy script
 ----------------------
 
-With these information the SD card can be identified. It will use the
-`ID_SERIAL` and `DEVNAME` environment variables in the script. Now I identified
-the tasks which need to be performed by the sd-autocopy script:
+Two scripts share the work. ``sd-autocopy`` (root, run by udev through
+``systemd-run``) checks the partition's filesystem **label** against
+``HANDLED_LABELS`` (labels survive camera reformats; filesystem UUIDs do
+not), mounts it under ``/mnt/sd-autocopy/<utc stamp>`` owned by ``USER``,
+and hands the mount point to ``sd-autocopy-copy``, run as that user.
 
+``sd-autocopy-copy`` (Python 3, stdlib + ``exiftool``) copies every
+``*.JPG|*.CR2|*.MOV`` on the card into two trees::
 
-1. Verify the sd card to be a handled one
-2. Mount the partition
-3. Find all images on the partition
-4. Create a folder for each date in a target base path
-5. Move the files to the date specific folder
-6. Unmount the partition
+    ~/autobackup/<YYYY-MM-DD>/<DCIM/...>/<basename>      verbatim mirror
+    ~/autocopy/<YYYY-MM-DD>/<ext>/<new name>             the pipeline workdir
 
-The script is placed in `/usr/local/bin/sd-autocopy` (just remove the testing
-code from that file). The finished script can be found in the git next to this
-README file.
+Naming
+~~~~~~
 
-The script can easily be extended by modifying the first few lines:
+``<new name>`` is ``<YYYYMMDD>_<HHMMSS>_<mmm>Z_<camtoken>_<basename>``, e.g.
+``20260915_125724_990Z_5ds_AAAE2634.CR2``:
 
-    USER=lm
-    TARGET=/home/$USER/Pictures/Photos
-    HANDLED_SERIALS="0x000006d4"
-    MOUNT=/mnt/sd-autocopy
-    FILE_MATCH=".*\.(jpg|cr2)$"
-    # Move or copy - or something different
-    TRANSFER=mv
+* the capture instant in **UTC** — EXIF ``DateTimeOriginal`` +
+  ``SubSecTimeOriginal`` converted through the camera's stamped
+  ``OffsetTimeOriginal`` (MOV: the same tags, or QuickTime ``CreateDate``).
+  Names therefore sort in capture order whatever the card's DCIM folders,
+  wherever the frame counter wrapped (9999→0001 opens a new folder on
+  Canon bodies — all folders of one card merge into one workdir), and
+  whichever zone the camera or this host was set to. Machines in different
+  zones feed one archive without disagreeing.
+* a **camera token**: the alias configured for the body's serial, else
+  ``<ModelShort>-<Serial>`` (``5DS-363055000036``). The workdir itself is
+  single-body; a second body on the same day is split out by hand before
+  the pipeline runs.
+* the camera's own **basename**, untouched: the pipeline's bracket
+  detection reads the frame counter from it, and it greps straight back to
+  the card and ``autobackup``.
 
-* `USER` is needed a) for gathering the target directory and b) for owning the copied files.
-* `TARGET` holds the path to the target base directory.
-* `HANDLED_SERIALS` holds a list of space separated serial numbers of the SD cards to use the script for.
-* `MOUNT` contains the mountpoint for the first partition on the SD card.
-* `FILE_MATCH` is the matching regex for the files to be copied. It applies to the whole path of the files.</li>
-* `TRANSFER` defines the transfer mode. For example "mv" to move the files or "cp" to copy them.
+The date dir is the same UTC day. Caveat, accepted on purpose: a late
+evening in Central Europe files under the next UTC day. A still with no
+``OffsetTimeOriginal`` (an older body, a foreign file) is still copied —
+its wall clock is taken as UTC and an alert is raised so the camera
+setting gets fixed; the pipeline refuses zone-less frames anyway.
 
-The script sends it's log entries to syslog, so you might want to have a look
-at the syslog files for debugging.
+Flow and failure
+~~~~~~~~~~~~~~~~
 
-Btw. the script is not limited to handling images. By just modifying the
-`FILE_MATCH` pattern it is possible to copy other filetypes.
+Per file, two stages, so ``exiftool`` never reads the card:
+
+1. the copier (serial): card → ``autobackup/.../.<name>.partial``, size
+   check, rename into place, fsync;
+2. the namer (a small thread pool): ``exiftool`` on the local copy → the
+   name; re-home the backup if its UTC day differs from the mtime guess;
+   reflink-mirror into ``autocopy`` (again partial + rename); **only then**
+   move the card file into ``<folder>/old/`` so the next insertion skips it.
+
+Both destinations are placed atomically, so a final name never holds a
+partial copy: a destination that already exists with the right size counts
+as copied (re-inserting a card after a crash resumes cleanly), a different
+size under the same name aborts rather than overwrites.
+
+A failing read means the card or reader is dropping out, and there is no
+recovering from that by moving on to the next file: the first failure of
+either stage aborts the whole run, leaves the card as it is, logs ``ABORT``
+to syslog and appends an alert through ``ALERT_PY`` (the synced per-host
+alert tree, visible from any machine; clear it by hand once acted on).
+
+Config
+~~~~~~
+
+``~/.config/sd-autocopy/env`` (``KEY=VALUE`` lines; all optional)::
+
+    AUTOCOPY_TARGET=~/autocopy
+    AUTOCOPY_BACKUP=~/autobackup
+    ALERT_PY=/home/koom/hackery2/src/hackery2/lib/alert.py
+    WORKERS=2
+    CAM_ALIAS_363055000036=5ds        # camera token per body serial
+
+Tokens are ``[A-Za-z0-9-]+`` — ``_`` is the name separator. An alias that
+breaks that rule aborts the run at config load.
+
+Running by hand
+~~~~~~~~~~~~~~~
+
+::
+
+    sd-autocopy-copy --dry-run /mnt/sd-autocopy/<stamp>    # print the plan, write nothing
+    sd-autocopy-copy -v /mnt/sd-autocopy/<stamp>           # copy, echoing the syslog lines
+    journalctl -t sd-autocopy -f                            # watch an automatic run
+
+Tests: ``uv run --locked --script tests/test_copy.py`` (a fake card of tiny
+JPEGs stamped with exiftool; nothing touches the real trees).
+
+Install: ``sudo cp sd-autocopy sd-autocopy-copy /usr/local/bin/`` and the
+udev rule into ``/etc/udev/rules.d/`` (see ``99-sd-autocopy.rules``).
